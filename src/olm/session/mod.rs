@@ -43,7 +43,10 @@ use super::{
 #[cfg(feature = "low-level-api")]
 use crate::hazmat::olm::MessageKey;
 use crate::{
-    olm::messages::{Message, OlmMessage, PreKeyMessage},
+    olm::{
+        messages::{Message, OlmMessage, PreKeyMessage},
+        session::double_ratchet::RatchetCount,
+    },
     utilities::{pickle, unpickle},
     Curve25519PublicKey, PickleError,
 };
@@ -158,7 +161,7 @@ impl Debug for Session {
 
         f.debug_struct("Session")
             .field("session_id", &self.session_id())
-            .field("sending_chain_index", &sending_ratchet.chain_index())
+            .field("sending_ratchet", &sending_ratchet)
             .field("receiving_chains", &receiving_chains.inner)
             .field("config", config)
             .finish_non_exhaustive()
@@ -193,8 +196,9 @@ impl Session {
         let root_key = RemoteRootKey::new(root_key);
         let remote_chain_key = RemoteChainKey::new(remote_chain_key);
 
-        let local_ratchet = DoubleRatchet::inactive(root_key, remote_ratchet_key);
-        let remote_ratchet = ReceiverChain::new(remote_ratchet_key, remote_chain_key);
+        let local_ratchet = DoubleRatchet::inactive_from_prekey_data(root_key, remote_ratchet_key);
+        let remote_ratchet =
+            ReceiverChain::new(remote_ratchet_key, remote_chain_key, RatchetCount::new());
 
         let mut ratchet_store = ChainStore::new();
         ratchet_store.push(remote_ratchet);
@@ -360,7 +364,7 @@ impl Session {
                     chain.chain_key_index,
                 );
 
-                ReceiverChain::new(ratchet_key, chain_key)
+                ReceiverChain::new(ratchet_key, chain_key, RatchetCount::unknown())
             }
         }
 
@@ -444,7 +448,7 @@ impl Session {
                         config: SessionConfig::version_1(),
                     })
                 } else if let Some(chain) = receiving_chains.get(0) {
-                    let sending_ratchet = DoubleRatchet::inactive(
+                    let sending_ratchet = DoubleRatchet::inactive_from_libolm_pickle(
                         RemoteRootKey::new(pickle.root_key.clone()),
                         chain.ratchet_key(),
                     );
@@ -512,20 +516,28 @@ impl From<SessionPickle> for Session {
 #[cfg(test)]
 mod test {
     use anyhow::{bail, Result};
+    use assert_matches::assert_matches;
     use olm_rs::{
         account::OlmAccount,
         session::{OlmMessage, OlmSession},
     };
 
-    use super::Session;
+    use super::{DecryptionError, Session};
     use crate::{
-        olm::{Account, SessionConfig, SessionPickle},
+        olm::{
+            messages,
+            session::receiver_chain::{MAX_MESSAGE_GAP, MAX_MESSAGE_KEYS},
+            Account, SessionConfig, SessionPickle,
+        },
         Curve25519PublicKey,
     };
 
     const PICKLE_KEY: [u8; 32] = [0u8; 32];
 
-    fn sessions() -> Result<(Account, OlmAccount, Session, OlmSession)> {
+    /// Create a pair of accounts, one using vodozemac and one libolm.
+    ///
+    /// Then, create a pair of sessions between the two.
+    pub fn session_and_libolm_pair() -> Result<(Account, OlmAccount, Session, OlmSession)> {
         let alice = Account::new();
         let bob = OlmAccount::new();
         bob.generate_one_time_keys(1);
@@ -560,49 +572,172 @@ mod test {
     }
 
     #[test]
-    fn out_of_order_decryption() -> Result<()> {
-        let (_, _, mut alice_session, bob_session) = sessions()?;
-
-        let message_1 = bob_session.encrypt("Message 1").into();
-        let message_2 = bob_session.encrypt("Message 2").into();
-        let message_3 = bob_session.encrypt("Message 3").into();
-
-        assert_eq!("Message 3".as_bytes(), alice_session.decrypt(&message_3)?);
-        assert_eq!("Message 2".as_bytes(), alice_session.decrypt(&message_2)?);
-        assert_eq!("Message 1".as_bytes(), alice_session.decrypt(&message_1)?);
-
-        Ok(())
+    fn session_config() {
+        let (_, _, alice_session, _) = session_and_libolm_pair().unwrap();
+        assert_eq!(alice_session.session_config(), SessionConfig::version_1());
     }
 
     #[test]
-    fn more_out_of_order_decryption() -> Result<()> {
-        let (_, _, mut alice_session, bob_session) = sessions()?;
+    fn has_received_message() {
+        let (_, _, mut alice_session, bob_session) = session_and_libolm_pair().unwrap();
+        assert!(!alice_session.has_received_message());
+        assert!(!bob_session.has_received_message());
+        let message = bob_session.encrypt("Message").into();
+        assert_eq!(
+            "Message".as_bytes(),
+            alice_session.decrypt(&message).expect("Should be able to decrypt message")
+        );
+        assert!(alice_session.has_received_message());
+        assert!(!bob_session.has_received_message());
+    }
+
+    #[test]
+    fn out_of_order_decryption() {
+        let (_, _, mut alice_session, bob_session) = session_and_libolm_pair().unwrap();
 
         let message_1 = bob_session.encrypt("Message 1").into();
         let message_2 = bob_session.encrypt("Message 2").into();
         let message_3 = bob_session.encrypt("Message 3").into();
 
-        assert_eq!("Message 1".as_bytes(), alice_session.decrypt(&message_1)?);
+        assert_eq!(
+            "Message 3".as_bytes(),
+            alice_session.decrypt(&message_3).expect("Should be able to decrypt message 3")
+        );
+        assert_eq!(
+            "Message 2".as_bytes(),
+            alice_session.decrypt(&message_2).expect("Should be able to decrypt message 2")
+        );
+        assert_eq!(
+            "Message 1".as_bytes(),
+            alice_session.decrypt(&message_1).expect("Should be able to decrypt message 1")
+        );
+    }
+
+    #[test]
+    fn more_out_of_order_decryption() {
+        let (_, _, mut alice_session, bob_session) = session_and_libolm_pair().unwrap();
+
+        let message_1 = bob_session.encrypt("Message 1").into();
+        let message_2 = bob_session.encrypt("Message 2").into();
+        let message_3 = bob_session.encrypt("Message 3").into();
+
+        assert_eq!(
+            "Message 1".as_bytes(),
+            alice_session.decrypt(&message_1).expect("Should be able to decrypt message 1")
+        );
 
         assert_eq!(alice_session.receiving_chains.len(), 1);
 
         let message_4 = alice_session.encrypt("Message 4").into();
-        assert_eq!("Message 4", bob_session.decrypt(message_4)?);
+        assert_eq!(
+            "Message 4",
+            bob_session.decrypt(message_4).expect("Should be able to decrypt message 4")
+        );
 
         let message_5 = bob_session.encrypt("Message 5").into();
-        assert_eq!("Message 5".as_bytes(), alice_session.decrypt(&message_5)?);
-        assert_eq!("Message 3".as_bytes(), alice_session.decrypt(&message_3)?);
-        assert_eq!("Message 2".as_bytes(), alice_session.decrypt(&message_2)?);
+        assert_eq!(
+            "Message 5".as_bytes(),
+            alice_session.decrypt(&message_5).expect("Should be able to decrypt message 5")
+        );
+        assert_eq!(
+            "Message 3".as_bytes(),
+            alice_session.decrypt(&message_3).expect("Should be able to decrypt message 3")
+        );
+        assert_eq!(
+            "Message 2".as_bytes(),
+            alice_session.decrypt(&message_2).expect("Should be able to decrypt message 2")
+        );
 
         assert_eq!(alice_session.receiving_chains.len(), 2);
+    }
 
-        Ok(())
+    #[test]
+    fn max_keys_out_of_order_decryption() {
+        let (_, _, mut alice_session, bob_session) = session_and_libolm_pair().unwrap();
+
+        let mut messages: Vec<messages::OlmMessage> = Vec::new();
+        for i in 0..(MAX_MESSAGE_KEYS + 2) {
+            messages.push(bob_session.encrypt(format!("Message {}", i).as_str()).into());
+        }
+
+        // Decrypt last message
+        assert_eq!(
+            format!("Message {}", MAX_MESSAGE_KEYS + 1).as_bytes(),
+            alice_session
+                .decrypt(&messages[MAX_MESSAGE_KEYS + 1])
+                .expect("Should be able to decrypt last message")
+        );
+
+        // Cannot decrypt first message because it is more than MAX_MESSAGE_KEYS ago
+        assert_matches!(
+            alice_session.decrypt(&messages[0]),
+            Err(DecryptionError::MissingMessageKey(_))
+        );
+
+        // Can decrypt all other messages
+        for (i, message) in messages.iter().enumerate().skip(1).take(MAX_MESSAGE_KEYS) {
+            assert_eq!(
+                format!("Message {}", i).as_bytes(),
+                alice_session
+                    .decrypt(message)
+                    .expect("Should be able to decrypt remaining messages")
+            );
+        }
+    }
+
+    #[test]
+    fn max_gap_out_of_order_decryption() {
+        let (_, _, mut alice_session, bob_session) = session_and_libolm_pair().unwrap();
+
+        for i in 0..(MAX_MESSAGE_GAP + 1) {
+            bob_session.encrypt(format!("Message {}", i).as_str());
+        }
+
+        let message = bob_session.encrypt("Message").into();
+        assert_matches!(
+            alice_session.decrypt(&message),
+            Err(DecryptionError::TooBigMessageGap(_, _))
+        );
+    }
+
+    #[test]
+    fn pickle_default_config() {
+        let json = r#"
+            {
+                "receiving_chains": {
+                    "inner": []
+                },
+                "sending_ratchet": {
+                    "active_ratchet": {
+                        "ratchet_key": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                        "root_key": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+                    },
+                    "parent_ratchet_key": null,
+                    "ratchet_count": {
+                        "Known": 1
+                    },
+                    "symmetric_key_ratchet": {
+                        "index": 1,
+                        "key": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+                    },
+                    "type": "active"
+                },
+                "session_keys": {
+                    "base_key": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+                    "identity_key": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+                    "one_time_key": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+                }
+            }
+        "#;
+        let pickle: SessionPickle =
+            serde_json::from_str(json).expect("Should be able to deserialize JSON");
+        assert_eq!(pickle.config, SessionConfig::version_1());
     }
 
     #[test]
     #[cfg(feature = "libolm-compat")]
-    fn libolm_unpickling() -> Result<()> {
-        let (_, _, mut session, olm) = sessions()?;
+    fn libolm_unpickling() {
+        let (_, _, mut session, olm) = session_and_libolm_pair().unwrap();
 
         let plaintext = "It's a secret to everybody";
         let old_message = session.encrypt(plaintext);
@@ -612,42 +747,49 @@ mod test {
         }
 
         let message = session.encrypt("Hello");
-        olm.decrypt(message.into())?;
+        olm.decrypt(message.into()).expect("Should be able to decrypt message");
 
         let key = b"DEFAULT_PICKLE_KEY";
         let pickle = olm.pickle(olm_rs::PicklingMode::Encrypted { key: key.to_vec() });
 
-        let mut unpickled = Session::from_libolm_pickle(&pickle, key)?;
+        let mut unpickled =
+            Session::from_libolm_pickle(&pickle, key).expect("Should be able to unpickle session");
 
         assert_eq!(olm.session_id(), unpickled.session_id());
 
-        assert_eq!(unpickled.decrypt(&old_message)?, plaintext.as_bytes());
+        assert_eq!(
+            unpickled
+                .decrypt(&old_message)
+                .expect("Should be able to decrypt old message with unpickled session"),
+            plaintext.as_bytes()
+        );
 
         let message = unpickled.encrypt(plaintext);
 
-        assert_eq!(session.decrypt(&message)?, plaintext.as_bytes());
-
-        Ok(())
+        assert_eq!(
+            session.decrypt(&message).expect("Should be able to decrypt re-encrypted message"),
+            plaintext.as_bytes()
+        );
     }
 
     #[test]
-    fn session_pickling_roundtrip_is_identity() -> Result<()> {
-        let (_, _, session, _) = sessions()?;
+    fn session_pickling_roundtrip_is_identity() {
+        let (_, _, session, _) = session_and_libolm_pair().unwrap();
 
         let pickle = session.pickle().encrypt(&PICKLE_KEY);
 
-        let decrypted_pickle = SessionPickle::from_encrypted(&pickle, &PICKLE_KEY)?;
+        let decrypted_pickle = SessionPickle::from_encrypted(&pickle, &PICKLE_KEY)
+            .expect("Should be able to decrypt encrypted pickle");
         let unpickled_group_session = Session::from_pickle(decrypted_pickle);
         let repickle = unpickled_group_session.pickle();
 
         assert_eq!(session.session_id(), unpickled_group_session.session_id());
 
-        let decrypted_pickle = SessionPickle::from_encrypted(&pickle, &PICKLE_KEY)?;
-        let pickle = serde_json::to_value(decrypted_pickle)?;
-        let repickle = serde_json::to_value(repickle)?;
+        let decrypted_pickle = SessionPickle::from_encrypted(&pickle, &PICKLE_KEY)
+            .expect("Should be able to decrypt encrypted pickle");
+        let pickle = serde_json::to_value(decrypted_pickle).unwrap();
+        let repickle = serde_json::to_value(repickle).unwrap();
 
         assert_eq!(pickle, repickle);
-
-        Ok(())
     }
 }
