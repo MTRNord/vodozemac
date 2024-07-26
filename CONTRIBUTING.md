@@ -4,6 +4,88 @@ Thank you for taking the time to contribute to Matrix!
 
 This is the repository for Vodozemac, a Rust implementation of Olm and Megolm.
 
+# Writing changelog entries
+
+We aim to maintain clear and informative changelogs that accurately reflect the
+changes in our project. This guide will help you write useful changelog entries
+using git-cliff, which fetches changelog entries from commit messages. 
+
+## Commit Message Format
+
+We support the default Conventional Commits format, along with a specific git
+trailer Changelog and Changelog(category).
+
+### Conventional Commits
+
+Conventional Commits are structured as follows:
+
+```
+<type>(<scope>): <short summary>
+```
+
+The type of changes which will be included in changelogs is one of the following:
+
+    feat: A new feature
+    fix: A bug fix
+    doc: Documentation changes
+    refactor: Code refactoring
+    perf: Performance improvements
+    ci: Changes to CI configuration files and scripts
+
+The scope is optional and can specify the area of the codebase affected (e.g.,
+olm, cipher).
+
+### Changelog Trailer
+
+In addition to the conventional commit format, you can use a git trailer to
+specify the changelog message explicitly. When the Changelog trailer is defined,
+the value from the trailer will be used in the changelog instead of the commit's
+first line.
+
+
+#### Example Commit Message
+```
+feat: Add a method to encode Ed25519 public keys to Base64
+
+This patch adds the Ed25519PublicKey::to_base64() method, which allows us to
+stringify Ed25519 and thus present them to users. It's also commonly used when
+Ed25519 keys need to be inserted into JSON.  
+
+Changelog: Added the Ed25519PublicKey::to_base64() method which can be used to
+stringify the Ed25519 public key.
+```
+
+### Security fixes
+
+Please only use the Git trailer style for changelog entries related to security
+issues since you need to specify and link to the relevant CVE and Github
+advisories. Including all the necessary information is not possible if we'd like
+to adhere to the convention of the first line in the commit message being bellow
+72 characters.
+
+Example:
+
+```
+fix: Use a constant-time Base64 encoder for secret key material
+
+This patch fixes a security issue around a side-channel vulnerability[1]
+when decoding secret key material using Base64.
+
+In some circumstances an attacker can obtain information about secret
+secret key material via a controlled-channel and side-channel attack.
+
+This patch avoids the side-channel by switching to the base64ct crate
+for the encoding, and more importantly, the decoding of secret key
+material.
+
+Security-Impact: Low
+CVE: CVE-2024-40640
+GitHub-Advisory: GHSA-j8cm-g7r6-hfpq
+
+Changelog: Use a constant-time Base64 encoder for secret key material
+to mitigate side-channel attacks leaking secret key material.
+```
+
 ## Sign off
 
 We ask that everybody who contributes to this project signs off their
